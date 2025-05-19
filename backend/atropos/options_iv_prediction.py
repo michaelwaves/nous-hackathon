@@ -26,17 +26,24 @@ You may use extremely long chains of thought to deeply consider the problem and 
 You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your final prediction."""  # noqa E501
 
 # User message template that contains task instructions
-user_message_template = """Your task is to analyze the following option price, underlying stock price, risk free rate, strike price, 
-                            and time to expiration and predict the implied volatility of the option
+user_message_template = """Your task is to analyze the following option data:
+Option Price: {option_price}
+Underlying Stock Price: {underlying_stock_price}
+Strike Price: {strike_price}
+Time to Expiration (Years): {time_to_expiration_years}
+Risk-Free Rate: {risk_free_rate}
+Option Type: {option_type}
+
+Predict the implied volatility of the option.
 
 Your final answer MUST use the exact format:
-"The implied volatility will be: {{answer}}
+"The implied volatility will be: {{answer}}%"
 
-Where {{answer}} is the implied volatility as a string in percent (e.g. 70%)
+Where {{answer}} is the implied volatility as a string (e.g., "70.5").
 
 Here is the data to analyze:
 
-{context}"""  # context = {}
+{context}"""  # context will be a summary string or can be integrated if needed
 
 
 class OptionsIVPrediction(BaseEnv):
@@ -57,8 +64,8 @@ class OptionsIVPrediction(BaseEnv):
             testing: Whether in testing mode
         """
         super().__init__(config, server_configs, slurm, testing)
-        self.percent_correct_buffer = list()
-        self.magnitude_accuracy_buffer = list()
+        self.percent_correct_buffer = list() # Tracks format correctness
+        self.iv_accuracy_buffer = list()    # Tracks IV prediction accuracy
         self.eval_metrics = list()
 
     @classmethod
@@ -95,7 +102,12 @@ class OptionsIVPrediction(BaseEnv):
         Set up the environment by loading and preparing the dataset.
         """
         # Load the full dataset
-        full_dataset = load_dataset('csv', data_files='unh_options.csv')
+        # Assuming 'unh_options.csv' has columns:
+        # 'lastPrice', 'strike', 'expirationDate', 'impliedVolatility', 'optionType', 'underlyingPrice', 'riskFreeRate'
+        # 'expirationDate' should be a parseable date string.
+        # 'impliedVolatility' should be a float (e.g., 0.705 for 70.5%)
+        full_dataset = load_dataset('csv', data_files={'train': 'unh_options.csv'})['train']
+
 
         full_dataset = full_dataset.shuffle(seed=42)
 
@@ -126,37 +138,69 @@ class OptionsIVPrediction(BaseEnv):
         Get the next training item from the dataset.
 
         Returns:
-            A tuple containing prompt and expected answer
+            A tuple containing prompt, expected IV answer, None (for magnitude), and "implied volatility"
         """
         next_item = self.train[self.iter % len(self.train)]
         self.iter += 1
 
-        # Extract context, answer, magnitude and fundamental metric from the dataset item
-        context = next_item["context"]
+        # Extract data from the dataset item
         option_price = next_item['lastPrice']
+        underlying_stock_price = next_item['underlyingPrice']
         strike_price = next_item['strike']
-        expiry = next_item[1]
-        now = pd.Timestamp.now()
-        time_to_expiration = (expiry - now).total_seconds() / (365.25 * 24 * 60 * 60)
-        risk_free_rate =  0.05
-        option_type = next_item[2]
+        
+        # Calculate time to expiration
+        try:
+            expiry_date_str = next_item['expirationDate']
+            # Assuming date format in CSV is 'YYYY-MM-DD HH:MM:SS' or similar pd.to_datetime can handle
+            expiry_datetime = pd.to_datetime(expiry_date_str)
+            now = pd.Timestamp.now(tz=expiry_datetime.tz) # Ensure timezone consistency
+            time_to_expiration_years = (expiry_datetime - now).total_seconds() / (365.25 * 24 * 60 * 60)
+            if time_to_expiration_years < 0: # Handle expired options if any in dataset
+                time_to_expiration_years = 1e-6 # A very small positive number
+        except Exception as e:
+            print(f"Error processing expiration date: {e}. Using default TTE.")
+            time_to_expiration_years = 0.25 # Default TTE if parsing fails
 
+        risk_free_rate = next_item.get('riskFreeRate', 0.05) # Use a default if not present
+        option_type = next_item['optionType'] # 'call' or 'put'
+        
+        # Expected answer: implied volatility as a string percentage (e.g., "70.5")
+        expected_iv_float = next_item['impliedVolatility'] 
+        expected_iv_answer_str = f"{expected_iv_float * 100:.1f}" # Format to one decimal place
 
+        fundamental_metric = "implied volatility" # This is fixed for this environment
 
-        print(time_to_expiration)
-        # Create prompt tuple using frozensets as required
+        # Create context string for the prompt
+        # The user_message_template now directly includes placeholders for these values.
+        # The {context} placeholder in the template can be used for additional narrative if any.
+        # For now, we'll pass an empty string or a summary if available.
+        # The main data is now part of the template itself.
+        
+        context_details = (
+            f"Option Price: {option_price}, "
+            f"Underlying Stock Price: {underlying_stock_price}, "
+            f"Strike Price: {strike_price}, "
+            f"Time to Expiration (Years): {time_to_expiration_years:.4f}, "
+            f"Risk-Free Rate: {risk_free_rate:.4f}, "
+            f"Option Type: {option_type}"
+        )
+
         prompt = []
-
-        # Add system prompt
         prompt.append(frozenset({"role": "system", "content": system_prompt}.items()))
 
-        # Format user message with context and fundamental metric
         user_content = user_message_template.format(
-            context=context, fundamental_metric=fundamental_metric
+            option_price=option_price,
+            underlying_stock_price=underlying_stock_price,
+            strike_price=strike_price,
+            time_to_expiration_years=f"{time_to_expiration_years:.4f}",
+            risk_free_rate=f"{risk_free_rate:.4f}",
+            option_type=option_type,
+            context=f"Further details: {next_item.get('context', 'N/A')}" # If there's a generic context field
         )
         prompt.append(frozenset({"role": "user", "content": user_content}.items()))
 
-        return (tuple(prompt), answer, magnitude, fundamental_metric)
+        # Return (prompt_tuple, expected_iv_str, None for magnitude, "implied volatility")
+        return (tuple(prompt), expected_iv_answer_str, None, fundamental_metric)
 
     async def collect_trajectories(self, item) -> Tuple[ScoredDataGroup, List]:
         """
@@ -199,13 +243,13 @@ class OptionsIVPrediction(BaseEnv):
                 {"role": "assistant", "content": completion_choice.text}
             )
 
-            # Add to scoring queue with expected answer, magnitude, and fundamental metric
+            # Add to scoring queue with expected answer (IV string), None (magnitude), and "implied volatility"
             to_score.append(
                 (
                     tuple(trajectory_messages),
-                    item[1],  # answer (maintained/raised/reduced)
-                    item[2],  # magnitude
-                    item[3],  # fundamental_metric
+                    item[1],  # expected_iv_answer_str
+                    item[2],  # None (for magnitude placeholder)
+                    item[3],  # "implied volatility"
                 )
             )
 
@@ -217,14 +261,14 @@ class OptionsIVPrediction(BaseEnv):
 
     def _extract_prediction(self, text, fundamental_metric):
         """
-        Extract the prediction and magnitude from the model's response.
+        Extract the implied volatility from the model's response.
 
         Args:
             text: Text containing the model's response
-            fundamental_metric: The fundamental metric being predicted
+            fundamental_metric: Should be "implied volatility"
 
         Returns:
-            Tuple of (prediction, magnitude) or (None, None) if extraction fails
+            Tuple of (iv_prediction_str, None) or (None, None) if extraction fails
         """
         # Check for thinking section
         think_tags = re.findall(r"<think>", text, re.IGNORECASE)
@@ -245,62 +289,61 @@ class OptionsIVPrediction(BaseEnv):
         if "<think>" not in thinking_section.lower():
             return None, None
 
-        # Escape fundamental_metric for regex
+        # Escape fundamental_metric for regex (e.g., "implied volatility")
         escaped_metric = re.escape(fundamental_metric)
 
-        # Extract prediction and magnitude using regex - dynamic to match the fundamental metric
-        pattern = f"The {escaped_metric} will be:\\s*(maintained|raised|reduced)\\s*and\\s*the\\s*magnitude\\s*will\\s*be:\\s*([-+]?\\d+(?:\\.\\d+)?)%"  # noqa E501
+        # Regex to capture IV: "The implied volatility will be: {{answer}}%"
+        # {{answer}} is a number, possibly with decimals.
+        pattern = f"The {escaped_metric} will be:\\s*([-+]?\\d+(?:\\.\\d+)?)%"
 
-        # Find all matches to check if there are multiple predictions
         all_matches = re.findall(pattern, answer_section, re.IGNORECASE)
 
-        # If no matches or multiple matches found, return None
         if len(all_matches) != 1:
-            return None, None
+            return None, None # No match or multiple matches
 
         # Extract single match
         matches = re.search(pattern, answer_section, re.IGNORECASE)
-        prediction = matches.group(1).lower()
-        magnitude = matches.group(2)
+        if not matches or len(matches.groups()) != 1:
+            return None, None
 
-        return prediction, magnitude
+        iv_prediction_str = matches.group(1)
 
-    def _calculate_magnitude_score(self, predicted_magnitude, expected_magnitude):
+        return iv_prediction_str, None # Return IV string and None for magnitude part
+
+    def _calculate_magnitude_score(self, predicted_iv_str, expected_iv_str):
         """
-        Calculate a score for magnitude prediction accuracy.
+        Calculate a score for IV prediction accuracy.
+        This was originally _calculate_magnitude_score, repurposed for IV.
 
         Args:
-            predicted_magnitude: The model's predicted magnitude percentage
-            expected_magnitude: The expected magnitude percentage
+            predicted_iv_str: The model's predicted IV string (e.g., "70.5")
+            expected_iv_str: The expected IV string (e.g., "72.0")
 
         Returns:
             Score between 0.0 and 1.0 based on how close the prediction is
         """
         try:
-            # Convert to float for comparison
-            pred_mag = float(predicted_magnitude)
-            exp_mag = float(expected_magnitude)
+            pred_iv = float(predicted_iv_str)
+            exp_iv = float(expected_iv_str)
 
-            # Calculate absolute difference
-            diff = abs(pred_mag - exp_mag)
+            diff = abs(pred_iv - exp_iv) # Difference in percentage points
 
-            # Score based on closeness to expected magnitude
+            # Score based on closeness (adjust thresholds as needed for IV)
             # Perfect match = 1.0
-            # Within 1% = 0.9
-            # Within 5% = 0.7
-            # Within 10% = 0.5
-            # Within 20% = 0.3
-            # More than 20% off = 0.0
-
+            # Within 1 percentage point = 0.9
+            # Within 2.5 percentage points = 0.7
+            # Within 5 percentage points = 0.5
+            # Within 10 percentage points = 0.3
+            # More than 10 percentage points off = 0.0
             if diff == 0:
                 return 1.0
-            elif diff <= 1:
+            elif diff <= 1.0: # 1% absolute IV difference
                 return 0.9
-            elif diff <= 5:
+            elif diff <= 2.5: # 2.5% absolute IV difference
                 return 0.7
-            elif diff <= 10:
+            elif diff <= 5.0: # 5% absolute IV difference
                 return 0.5
-            elif diff <= 20:
+            elif diff <= 10.0: # 10% absolute IV difference
                 return 0.3
             else:
                 return 0.0
@@ -313,7 +356,7 @@ class OptionsIVPrediction(BaseEnv):
         self, rollout_group_data
     ) -> Union[Optional[ScoredDataGroup], List[Optional[ScoredDataGroup]]]:
         """
-        Score the generated model responses for fundamental metric predictions.
+        Score the generated model responses for implied volatility predictions.
 
         Args:
             rollout_group_data: List of generated responses with expected answers
@@ -326,12 +369,10 @@ class OptionsIVPrediction(BaseEnv):
         scores["masks"] = list()
         scores["scores"] = list()
 
-        # Get the expected answer, magnitude, and fundamental metric
-        expected_answer = rollout_group_data[0][
-            1
-        ]  # "maintained", "raised", or "reduced"
-        expected_magnitude = rollout_group_data[0][2]  # Expected percentage change
-        fundamental_metric = rollout_group_data[0][3]  # Type of fundamental metric
+        # Get the expected answer (IV string) and fundamental metric ("implied volatility")
+        expected_iv_str = rollout_group_data[0][1]  # Expected IV string (e.g., "70.5")
+        # expected_magnitude is rollout_group_data[0][2], which is None for this env
+        fundamental_metric = rollout_group_data[0][3]  # "implied volatility"
 
         # Shuffle to avoid bias in selection
         random.shuffle(rollout_group_data)
@@ -340,24 +381,25 @@ class OptionsIVPrediction(BaseEnv):
             # Extract the model's response
             model_response = item[0][-1]["content"]
 
-            # Extract the prediction and magnitude from the model's response
-            prediction, magnitude = self._extract_prediction(
+            # Extract the prediction (IV string) from the model's response
+            predicted_iv_str, _ = self._extract_prediction( # Second element is None
                 model_response, fundamental_metric
             )
 
             # Calculate final score
-            if prediction is None:
-                final_score = 0.0  # Invalid format
-            elif prediction == expected_answer:
-                # Correct direction: base score of 1 + magnitude bonus
-                magnitude_score = (
-                    self._calculate_magnitude_score(magnitude, expected_magnitude)
-                    if magnitude is not None
-                    else 0.0
-                )
-                final_score = 1.0 + magnitude_score
+            format_correct_and_extracted = 0.0
+            iv_accuracy_score = 0.0
+
+            if predicted_iv_str is None:
+                final_score = 0.0  # Invalid format or extraction failure
             else:
-                final_score = 0.0  # Incorrect direction
+                format_correct_and_extracted = 1.0
+                # Calculate IV accuracy score
+                iv_accuracy_score = self._calculate_magnitude_score(
+                    predicted_iv_str, expected_iv_str
+                )
+                # Base score for correct format + IV accuracy bonus
+                final_score = 1.0 + iv_accuracy_score 
 
             # Apply length penalty for responses that are too long
             response_tokens = len(self.tokenizer.encode(model_response))
@@ -382,14 +424,9 @@ class OptionsIVPrediction(BaseEnv):
             scores["scores"].append(binary_reward)
 
             # For tracking metrics
-            directional_correct = (
-                1.0 if prediction == expected_answer and prediction is not None else 0.0
-            )
-            self.percent_correct_buffer.append(directional_correct)
-            if prediction == expected_answer and magnitude is not None:
-                self.magnitude_accuracy_buffer.append(
-                    self._calculate_magnitude_score(magnitude, expected_magnitude)
-                )
+            self.percent_correct_buffer.append(format_correct_and_extracted)
+            if format_correct_and_extracted == 1.0: # Only record accuracy if format was OK
+                self.iv_accuracy_buffer.append(iv_accuracy_score)
 
             # Break once we have enough examples
             if len(scores["tokens"]) >= self.config.group_size:
@@ -406,20 +443,39 @@ class OptionsIVPrediction(BaseEnv):
         Generate and score model responses for a single test item.
 
         Args:
-            test_item: Test item from dataset
+            test_item: Test item from dataset (already processed by get_next_item structure)
 
         Returns:
-            Dictionary with direction and magnitude scores
+            Dictionary with format_correct_score and iv_accuracy_score
         """
-        # Extract context, answer, magnitude and fundamental metric from the test item
-        context = test_item["context"]
-        expected_answer = test_item["answer"]
-        expected_magnitude = test_item["magnitude"]
-        fundamental_metric = test_item["fundamental_metric"]
+        # Reconstruct prompt and expected values from test_item if it's raw from dataset
+        # Or assume test_item is already in the (prompt_tuple, expected_iv_str, None, "implied volatility") format
+        # For simplicity, let's assume test_item is raw and we re-process it like in get_next_item
+        
+        option_price = test_item['lastPrice']
+        underlying_stock_price = test_item['underlyingPrice']
+        strike_price = test_item['strike']
+        try:
+            expiry_date_str = test_item['expirationDate']
+            expiry_datetime = pd.to_datetime(expiry_date_str)
+            now = pd.Timestamp.now(tz=expiry_datetime.tz)
+            time_to_expiration_years = (expiry_datetime - now).total_seconds() / (365.25 * 24 * 60 * 60)
+            if time_to_expiration_years < 0: time_to_expiration_years = 1e-6
+        except Exception: time_to_expiration_years = 0.25
+        risk_free_rate = test_item.get('riskFreeRate', 0.05)
+        option_type = test_item['optionType']
+        expected_iv_float = test_item['impliedVolatility']
+        expected_iv_str = f"{expected_iv_float * 100:.1f}"
+        fundamental_metric = "implied volatility"
 
-        # Format user message with context and fundamental metric
         user_content = user_message_template.format(
-            context=context, fundamental_metric=fundamental_metric
+            option_price=option_price,
+            underlying_stock_price=underlying_stock_price,
+            strike_price=strike_price,
+            time_to_expiration_years=f"{time_to_expiration_years:.4f}",
+            risk_free_rate=f"{risk_free_rate:.4f}",
+            option_type=option_type,
+            context=f"Further details: {test_item.get('context', 'N/A')}"
         )
 
         # Create messages for model
@@ -445,29 +501,27 @@ class OptionsIVPrediction(BaseEnv):
         # Extract the model's response
         model_response = completion.choices[0].text
 
-        # Extract prediction and magnitude
-        prediction, magnitude = self._extract_prediction(
+        # Extract prediction (IV string)
+        predicted_iv_str, _ = self._extract_prediction(
             model_response, fundamental_metric
         )
 
-        # Calculate direction score (1 for correct, 0 for incorrect)
-        direction_score = (
-            1 if prediction == expected_answer and prediction is not None else 0
-        )
+        # Calculate format correctness score (1 if IV extracted, 0 otherwise)
+        format_correct_score = 1.0 if predicted_iv_str is not None else 0.0
 
-        # Calculate magnitude score if direction is correct
-        magnitude_score = 0
-        if direction_score == 1 and magnitude is not None:
-            magnitude_score = self._calculate_magnitude_score(
-                magnitude, expected_magnitude
+        # Calculate IV accuracy score if format is correct
+        iv_accuracy_score = 0.0
+        if format_correct_score == 1.0:
+            iv_accuracy_score = self._calculate_magnitude_score(
+                predicted_iv_str, expected_iv_str
             )
 
-        # Calculate combined score (1 + magnitude_score for correct direction, 0 for incorrect)
-        combined_score = (1 + magnitude_score) if direction_score == 1 else 0
+        # Calculate combined score (e.g., 1 + iv_accuracy_score if format is correct, 0 otherwise)
+        combined_score = (1.0 + iv_accuracy_score) if format_correct_score == 1.0 else 0.0
 
         return {
-            "direction_score": direction_score,
-            "magnitude_score": magnitude_score,
+            "format_correct_score": format_correct_score, # Renamed from direction_score
+            "iv_accuracy_score": iv_accuracy_score,       # Renamed from magnitude_score
             "combined_score": combined_score,
         }
 
@@ -483,58 +537,60 @@ class OptionsIVPrediction(BaseEnv):
         all_scores = await tqdm_asyncio.gather(*eval_tasks)
 
         # Calculate aggregate metrics
-        direction_scores = [score["direction_score"] for score in all_scores]
-        magnitude_scores = [
-            score["magnitude_score"]
+        format_correct_scores = [score["format_correct_score"] for score in all_scores]
+        iv_accuracy_scores = [
+            score["iv_accuracy_score"]
             for score in all_scores
-            if score["direction_score"] == 1
+            if score["format_correct_score"] == 1.0 # Only consider accuracy if format was correct
         ]
         combined_scores = [score["combined_score"] for score in all_scores]
 
         # Calculate and log metrics
-        direction_accuracy = (
-            sum(direction_scores) / len(direction_scores) if direction_scores else 0
+        avg_format_correctness = (
+            sum(format_correct_scores) / len(format_correct_scores) if format_correct_scores else 0
         )
-        magnitude_accuracy = (
-            sum(magnitude_scores) / len(magnitude_scores) if magnitude_scores else 0
+        avg_iv_accuracy = (
+            sum(iv_accuracy_scores) / len(iv_accuracy_scores) if iv_accuracy_scores else 0
         )
         average_combined_score = (
             sum(combined_scores) / len(combined_scores) if combined_scores else 0
         )
 
-        self.eval_metrics.append(("eval/direction_accuracy", direction_accuracy))
-        self.eval_metrics.append(("eval/magnitude_accuracy", magnitude_accuracy))
+        self.eval_metrics.append(("eval/avg_format_correctness", avg_format_correctness))
+        self.eval_metrics.append(("eval/avg_iv_accuracy", avg_iv_accuracy))
         self.eval_metrics.append(("eval/combined_score", average_combined_score))
 
     async def wandb_log(self, wandb_metrics: Optional[Dict] = None):
         if wandb_metrics is None:
             wandb_metrics = {}
 
-        # Calculate and log training direction accuracy
+        # Calculate and log training format correctness
         try:
-            direction_accuracy = sum(self.percent_correct_buffer) / len(
+            avg_format_correctness = sum(self.percent_correct_buffer) / len(
                 self.percent_correct_buffer
             )
-            wandb_metrics["train/direction_accuracy"] = direction_accuracy
+            wandb_metrics["train/avg_format_correctness"] = avg_format_correctness
         except ZeroDivisionError:
-            pass  # Skip if buffer is empty
+            pass
 
-        # Calculate and log training magnitude accuracy
+        # Calculate and log training IV accuracy
         try:
-            magnitude_accuracy = sum(self.magnitude_accuracy_buffer) / len(
-                self.magnitude_accuracy_buffer
+            avg_iv_accuracy = sum(self.iv_accuracy_buffer) / len(
+                self.iv_accuracy_buffer
             )
-            wandb_metrics["train/magnitude_accuracy"] = magnitude_accuracy
+            wandb_metrics["train/avg_iv_accuracy"] = avg_iv_accuracy
         except ZeroDivisionError:
-            pass  # Skip if buffer is empty
+            pass
 
-        # Calculate combined training score (direction + magnitude)
+        # Calculate combined training score
         try:
-            combined_score = (
-                direction_accuracy + magnitude_accuracy
-                if "direction_accuracy" in wandb_metrics
-                else 0
-            )
+            combined_score = 0
+            if "train/avg_format_correctness" in wandb_metrics and "train/avg_iv_accuracy" in wandb_metrics:
+                 # Example: average of the two, or weighted sum
+                combined_score = (wandb_metrics["train/avg_format_correctness"] + wandb_metrics["train/avg_iv_accuracy"]) / 2
+            elif "train/avg_format_correctness" in wandb_metrics: # If only format is available
+                 combined_score = wandb_metrics["train/avg_format_correctness"]
+
             wandb_metrics["train/combined_score"] = combined_score
         except Exception as e:
             print(f"Error calculating combined score: {e}")
@@ -542,7 +598,7 @@ class OptionsIVPrediction(BaseEnv):
 
         # Clear the buffers after logging
         self.percent_correct_buffer = list()
-        self.magnitude_accuracy_buffer = list()
+        self.iv_accuracy_buffer = list()
 
         # Log evaluation metrics
         for item in self.eval_metrics:
@@ -554,7 +610,7 @@ class OptionsIVPrediction(BaseEnv):
     async def add_rollouts_for_wandb(
         self,
         scored_data: Union[ScoredDataGroup, List[ScoredDataGroup]],
-        item: Item = None,
+        item: Item = None, # item is (prompt_tuple, expected_iv_str, None, "implied volatility")
     ):
         # Initialize rollouts_for_wandb if not exists
         if not hasattr(self, "rollouts_for_wandb"):
@@ -566,8 +622,8 @@ class OptionsIVPrediction(BaseEnv):
         if num_keep == -1:
             num_keep = self.config.group_size
 
-        # Get fundamental metric from item
-        fundamental_metric = item[3]
+        # Get metric type from item
+        metric_type = item[3] # Should be "implied volatility"
 
         # Add examples to rollouts
         self.rollouts_for_wandb.append(
@@ -575,9 +631,9 @@ class OptionsIVPrediction(BaseEnv):
                 (
                     self.tokenizer.decode(scored_data["tokens"][i]),
                     scored_data["scores"][i],
-                    item[1],  # expected direction (maintained/raised/reduced)
-                    item[2],  # expected magnitude
-                    fundamental_metric,  # metric type being predicted
+                    item[1],  # expected_iv_str
+                    None,     # placeholder for expected_magnitude, which is not used here
+                    metric_type, 
                 )
                 for i in range(min(num_keep, len(scored_data["tokens"])))
             ]
@@ -594,15 +650,15 @@ class OptionsIVPrediction(BaseEnv):
                 columns=[
                     "text",
                     "score",
-                    "expected_direction",
-                    "expected_magnitude",
-                    "fundamental_metric",
+                    "expected_iv", # Renamed from expected_direction
+                    "expected_magnitude_placeholder", # Renamed, clarify it's a placeholder
+                    "metric_type", # Renamed from fundamental_metric for consistency
                 ]
             )
 
             for group in self.rollouts_for_wandb:
-                for item in group:
-                    table.add_data(item[0], item[1], item[2], item[3], item[4])
+                for item_tuple in group: # Renamed item to item_tuple to avoid conflict
+                    table.add_data(item_tuple[0], item_tuple[1], item_tuple[2], item_tuple[3], item_tuple[4])
 
             wandb_metrics["train/rollouts"] = table
 

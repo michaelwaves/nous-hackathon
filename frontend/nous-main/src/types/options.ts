@@ -15,6 +15,11 @@ export interface OptionContract {
   lastTradeDate: string;
   isRecommended?: boolean;
   confidence?: number;
+  // New fields
+  timeToExpiry?: number;
+  riskFreeRate?: number;
+  predictedVolatility?: number;
+  volatilityDifference?: number;
   // Greeks
   delta?: number;
   gamma?: number;

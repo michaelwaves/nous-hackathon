@@ -1,4 +1,3 @@
-
 import React, { useState } from 'react';
 import { OptionContract, OptionsFilters } from '@/types/options';
 import { Button } from '@/components/ui/button';
@@ -11,7 +10,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { getRecommendationReasons } from '@/services/optionsAPI';
-import { ChevronDown, ChevronUp, Info } from 'lucide-react';
+import { ChevronDown, ChevronUp, Info, TrendingDown, TrendingUp } from 'lucide-react';
 
 interface OptionsTableProps {
   options: OptionContract[];
@@ -64,8 +63,8 @@ export function OptionsTable({ options, filters, loading }: OptionsTableProps) {
     return sortableOptions;
   };
 
-  // Format values for display
-  const formatValue = (value: number | undefined, type: 'price' | 'percent' | 'numeric' | 'delta') => {
+  // Format values for display with more precision
+  const formatValue = (value: number | undefined, type: 'price' | 'percent' | 'numeric' | 'delta' | 'timeToExpiry' | 'volatilityDiff') => {
     if (value === undefined || value === null) return 'N/A';
     
     switch (type) {
@@ -75,6 +74,10 @@ export function OptionsTable({ options, filters, loading }: OptionsTableProps) {
         return `${value.toFixed(2)}%`;
       case 'delta':
         return value.toFixed(4);
+      case 'timeToExpiry':
+        return value.toFixed(6);
+      case 'volatilityDiff':
+        return `${value > 0 ? '+' : ''}${value.toFixed(3)}%`;
       default:
         return value.toString();
     }
@@ -92,6 +95,15 @@ export function OptionsTable({ options, filters, loading }: OptionsTableProps) {
           ? ' text-loss font-medium'
           : '';
     }
+
+    // Add color for volatility difference
+    if (key === 'volatilityDifference') {
+      className += value > 2 
+        ? ' text-profit font-medium' 
+        : value < -2 
+          ? ' text-loss font-medium'
+          : '';
+    }
     
     return className;
   };
@@ -104,9 +116,55 @@ export function OptionsTable({ options, filters, loading }: OptionsTableProps) {
     return sortConfig.direction === 'asc' ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />;
   };
 
+  const getRecommendationBadge = (option: OptionContract) => {
+    if (option.volatilityDifference === undefined) return null;
+    
+    const diff = option.volatilityDifference;
+    const isGoodInvestment = diff > 2; // If predicted IV is at least 2% higher than actual IV
+    const isBadInvestment = diff < -2; // If predicted IV is at least 2% lower than actual IV
+    
+    if (!isGoodInvestment && !isBadInvestment) return null;
+    
+    return (
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge 
+              variant="outline" 
+              className={`border-${isGoodInvestment ? 'profit' : 'loss'} text-${isGoodInvestment ? 'profit' : 'loss'} py-0 h-5`}
+            >
+              <span className="flex items-center gap-1">
+                {isGoodInvestment ? 
+                  <TrendingUp className="h-3 w-3" /> : 
+                  <TrendingDown className="h-3 w-3" />
+                }
+                <span className="text-xs">
+                  {isGoodInvestment ? 'Buy' : 'Avoid'}
+                </span>
+              </span>
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="right">
+            <p className="font-medium text-xs">
+              {isGoodInvestment ? 'Recommended Investment' : 'Not Recommended'}
+            </p>
+            <p className="text-muted-foreground text-xs">
+              {isGoodInvestment 
+                ? `Undervalued by ${formatValue(Math.abs(diff), 'volatilityDiff')}. Predicted IV is higher than market IV.`
+                : `Overvalued by ${formatValue(Math.abs(diff), 'volatilityDiff')}. Market IV is higher than predicted IV.`
+              }
+            </p>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
+  };
+
   const columnConfig = [
     { key: 'strike', label: 'Strike', type: 'price' as const, sortable: true },
     { key: 'expiryDate', label: 'Expiry', type: 'text' as const, sortable: true },
+    { key: 'timeToExpiry', label: 'Time (Years)', type: 'timeToExpiry' as const, sortable: true },
+    { key: 'riskFreeRate', label: 'Risk-Free Rate', type: 'percent' as const, sortable: true },
     { key: 'lastPrice', label: 'Last', type: 'price' as const, sortable: true },
     { key: 'bid', label: 'Bid', type: 'price' as const, sortable: true },
     { key: 'ask', label: 'Ask', type: 'price' as const, sortable: true },
@@ -114,7 +172,9 @@ export function OptionsTable({ options, filters, loading }: OptionsTableProps) {
     { key: 'percentChange', label: '% Chg', type: 'percent' as const, sortable: true },
     { key: 'volume', label: 'Volume', type: 'numeric' as const, sortable: true },
     { key: 'openInterest', label: 'OI', type: 'numeric' as const, sortable: true },
-    { key: 'impliedVolatility', label: 'IV', type: 'percent' as const, sortable: true },
+    { key: 'impliedVolatility', label: 'Actual IV', type: 'percent' as const, sortable: true },
+    { key: 'predictedVolatility', label: 'Predicted IV', type: 'percent' as const, sortable: true },
+    { key: 'volatilityDifference', label: 'IV Diff', type: 'volatilityDiff' as const, sortable: true },
     { key: 'delta', label: 'Delta', type: 'delta' as const, sortable: true },
     { key: 'gamma', label: 'Gamma', type: 'delta' as const, sortable: false },
     { key: 'theta', label: 'Theta', type: 'delta' as const, sortable: false },
@@ -164,41 +224,20 @@ export function OptionsTable({ options, filters, loading }: OptionsTableProps) {
               ) : (
                 sortedOptions.map((option) => {
                   const isExpanded = expandedContract === option.contractSymbol;
-                  const recommendationReasons = option.isRecommended ? getRecommendationReasons(option) : [];
+                  const recommendationReasons = getRecommendationReasons(option);
                   
                   return (
                     <React.Fragment key={option.contractSymbol}>
                       <tr 
                         className={`
                           border-b border-muted/30 transition-colors
-                          ${option.isRecommended ? 'bg-option-highlight' : ''}
+                          ${option.volatilityDifference && option.volatilityDifference > 2 ? 'bg-option-highlight' : ''}
                           ${isExpanded ? 'bg-secondary/70' : ''}
                         `}
                       >
                         <td className="text-left align-middle">
                           <div className="flex items-center">
-                            {option.isRecommended && (
-                              <TooltipProvider>
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <Badge variant="outline" className="border-neutral text-neutral py-0 h-5">
-                                      <span className="flex items-center gap-1">
-                                        <span className="text-xs">RL</span>
-                                        <span className="text-[0.65rem]">
-                                          {option.confidence !== undefined
-                                            ? `${(Number(option.confidence) * 100).toFixed(0)}%`
-                                            : ''}
-                                        </span>
-                                      </span>
-                                    </Badge>
-                                  </TooltipTrigger>
-                                  <TooltipContent side="right">
-                                    <p className="font-medium text-xs">AI Model Recommendation</p>
-                                    <p className="text-muted-foreground text-xs">{recommendationReasons[0]}</p>
-                                  </TooltipContent>
-                                </Tooltip>
-                              </TooltipProvider>
-                            )}
+                            {getRecommendationBadge(option)}
                             <Button 
                               variant="ghost" 
                               size="icon" 
@@ -239,15 +278,43 @@ export function OptionsTable({ options, filters, loading }: OptionsTableProps) {
                                   </p>
                                 </div>
                                 
-                                {option.isRecommended && (
+                                {option.volatilityDifference !== undefined && (
                                   <div>
                                     <h4 className="font-medium mb-1 flex items-center gap-1">
-                                      AI Model Analysis
+                                      Volatility Analysis
                                     </h4>
                                     <ul className="list-disc pl-4 space-y-1">
-                                      {recommendationReasons.map((reason, idx) => (
-                                        <li key={idx} className="text-muted-foreground">{reason}</li>
-                                      ))}
+                                      {option.volatilityDifference > 2 && (
+                                        <>
+                                          <li className="text-profit">
+                                            Undervalued by {formatValue(Math.abs(option.volatilityDifference), 'volatilityDiff')}
+                                          </li>
+                                          <li className="text-muted-foreground">
+                                            Our model predicts higher volatility than the market is pricing in
+                                          </li>
+                                          <li className="text-muted-foreground">
+                                            Potential opportunity for a profitable trade
+                                          </li>
+                                        </>
+                                      )}
+                                      {option.volatilityDifference < -2 && (
+                                        <>
+                                          <li className="text-loss">
+                                            Overvalued by {formatValue(Math.abs(option.volatilityDifference), 'volatilityDiff')}
+                                          </li>
+                                          <li className="text-muted-foreground">
+                                            The market is pricing in higher volatility than our model predicts
+                                          </li>
+                                          <li className="text-muted-foreground">
+                                            Consider avoiding this contract or selling if owned
+                                          </li>
+                                        </>
+                                      )}
+                                      {Math.abs(option.volatilityDifference) <= 2 && (
+                                        <li className="text-muted-foreground">
+                                          Contract is fairly valued (within 2% volatility difference)
+                                        </li>
+                                      )}
                                     </ul>
                                   </div>
                                 )}
